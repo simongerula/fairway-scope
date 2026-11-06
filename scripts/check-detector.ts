@@ -100,6 +100,7 @@ function step(det: ShotDetector, events: DetectorEvent[], frames: number) {
 }
 
 let failures = 0;
+(globalThis as { __DBG_DET?: boolean }).__DBG_DET = process.env.DBG_DET === '1';
 function expect(cond: boolean, msg: string) {
   if (cond) {
     console.log(`  ok   ${msg}`);
@@ -243,6 +244,70 @@ console.log('F: soft chip 12 m/s -> shot');
     console.log(`       ballSpeed=${shot.metrics.ballSpeedMps.toFixed(1)} m/s, launch=${shot.metrics.launchDeg.toFixed(1)}°`);
     expect(shot.metrics.ballSpeedMps > 10 && shot.metrics.ballSpeedMps < 15, `speed plausible (${shot.metrics.ballSpeedMps.toFixed(1)})`);
   }
+}
+
+// scenario G: wedge flight only visible for one frame at the camera (30fps
+// phones) -> departure shot estimated from the single streak position --------
+console.log('G: 1-frame wedge departure -> estimated shot');
+{
+  const { det, events } = makeDetector();
+  placeBall(0, 0);
+  step(det, events, 200); // past the 3s lock confirmation
+  expect(events.some((e) => e.type === 'lockConfirmed'), 'lockConfirmed after 3s');
+  const speed = 12; // m/s
+  const speedPx = (speed * (BALL_R / 0.04267)) / FPS;
+  // 55° wedge: exits the top of the analysis strip after ~3 frames
+  const vx = speedPx * Math.cos((55 * Math.PI) / 180);
+  const vy = speedPx * Math.sin((55 * Math.PI) / 180);
+  let visible = 0;
+  for (let i = 0; i < 40; i++) {
+    ball.px = ball.x; ball.py = ball.y;
+    ball.x += vx;
+    ball.y -= vy;
+    const stillIn = ball.y > BALL_Y - BALL_R * 14 && ball.x < PW;
+    if (stillIn) visible++;
+    if (!stillIn) {
+      ball.on = false;
+      break;
+    }
+    step(det, events, 1);
+  }
+  step(det, events, 30);
+  const shot = events.find((e) => e.type === 'shot') as
+    | { type: 'shot'; metrics: { ballSpeedMps: number; launchDeg: number; trackCount: number } }
+    | undefined;
+  expect(!!shot, `shot event emitted (streak visible ${visible} frames)`);
+  if (shot) {
+    console.log(`       est ballSpeed=${shot.metrics.ballSpeedMps.toFixed(1)} m/s, launch=${shot.metrics.launchDeg.toFixed(1)}°, track=${shot.metrics.trackCount}`);
+    expect(shot.metrics.ballSpeedMps > 9 && shot.metrics.ballSpeedMps < 18, `speed estimate plausible (${shot.metrics.ballSpeedMps.toFixed(1)})`);
+    expect(shot.metrics.launchDeg > 30 && shot.metrics.launchDeg <= 70, `launch estimate plausible (${shot.metrics.launchDeg.toFixed(1)}°)`);
+  }
+}
+
+// scenario H: pickup after the lock beep is still not a hit ------------------
+console.log('H: slow pickup after lock confirmation -> no shot');
+{
+  const { det, events } = makeDetector();
+  placeBall(0, 0);
+  step(det, events, 200);
+  expect(events.some((e) => e.type === 'lockConfirmed'), 'lock confirmed');
+  removeBall(); // gently pick the ball up: no ball-like motion anywhere
+  step(det, events, 60);
+  expect(!events.some((e) => e.type === 'shot'), 'no shot from a pickup');
+  expect(events.some((e) => e.type === 'trackAborted' && e.reason === 'ball-removed'), 'ball-removed signal emitted');
+  expect(det.state === 'waiting', 'waiting again after pickup');
+}
+
+// scenario I: early departure (before the 3s beep) does not count ------------
+console.log('I: removal before lock confirmation -> no shot');
+{
+  const { det, events } = makeDetector();
+  placeBall(0, 0);
+  step(det, events, 60); // only 1s < LOCK_CONFIRM_MS
+  expect(!events.some((e) => e.type === 'lockConfirmed'), 'not confirmed yet');
+  removeBall();
+  step(det, events, 60);
+  expect(!events.some((e) => e.type === 'shot'), 'no shot before lock confirmation');
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

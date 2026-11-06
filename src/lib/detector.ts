@@ -53,8 +53,12 @@ const DEFAULT_OPTS: DetectorOptions = { minSpeedMps: 8, maxSpeedMps: 110 };
 /** after arming, hold triggers this long so the hand leaving the ball doesn't fire */
 const QUIET_HOLD_MS = 250;
 
-/** after a false-trigger abort, hold triggers this long so the intruder doesn't re-fire */
-const ABORT_QUIET_MS = 700;
+/** after a false-trigger abort, hold triggers this long so the intruder doesn't re-fire
+ *  (short: a real departure signal arrives 2-3 frames behind an aborted wobble) */
+const ABORT_QUIET_MS = 250;
+
+/** the ball must hold its spot this long (with a beep) before hits are accepted */
+export const LOCK_CONFIRM_MS = 3000;
 
 export class ShotDetector {
   private canvas: HTMLCanvasElement | null = null;
@@ -68,6 +72,8 @@ export class ShotDetector {
   private bg: Float32Array = new Float32Array(0);
   /** 1 = cell lies over the resting ball; never adapt those cells while waiting/armed. */
   private ballProtect: Uint8Array = new Uint8Array(0);
+  /** summed-area table buffer for the free-placement scan */
+  private satBuf: Float32Array = new Float32Array(0);
   /** number of motion-active cells in the last frame (scene-change guard). */
   private lastActiveCount = 0;
   private lastVideoT = -1;
@@ -90,13 +96,23 @@ export class ShotDetector {
   private candFrames = 0;
   private lastCandX = -1;
   private lastCandY = -1;
-  private lastCandArea = 0;
-  private brightFrames = 0;
+  /** radius (px) of the last stable candidate — gates the 10-frame stability count */
+  private candR = 0;
+  /** direction of the current shot's flight as actually observed (+1 = right)
+   *  — set from the first tracked flight point, not from the calibrated arrow */
+  private shotDir: 1 | -1 = 1;
 
   private armedAtWall = 0;
   private goneFrames = 0;
   /** what fired the current recording: fast motion band or the spot-change signal */
   private triggeredBy: 'motion' | 'gone' = 'motion';
+  /** true once the ball has held its spot for LOCK_CONFIRM_MS — then any
+   * ball-like departure counts as a hit even without a full flight track */
+  private lockConfirmed = false;
+  /** video timestamp when the spot change was first seen (speed estimation) */
+  private goneStartVideoT = -1;
+  /** video timestamp when the current capture began */
+  private recStartVideoT = -1;
 
   private points: TrackedPoint[] = [];
   private recStartWall = 0;
@@ -104,6 +120,8 @@ export class ShotDetector {
   private cooldownUntilWall = 0;
   /** wall time until which triggers are held after a false-trigger abort */
   private quietUntilWall = 0;
+  /** wall time of the most recent update() call (used for wall-clock timers) */
+  private lastWallT = performance.now();
 
   attach(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -122,39 +140,25 @@ export class ShotDetector {
     this.threshold = thresholdFor(sensitivity);
     this.hitDir = cal.hitDir;
 
-    this.ballX = cal.ballNX * PROC_W;
-    this.ballY = cal.ballNY * vh;
-    this.ballR = Math.max(3, cal.ballNR * vh);
-
-    // analysis rect = ball area padded generously, plus everything downrange
-    const padX = this.ballR * 6;
-    const y0 = Math.max(0, Math.floor((this.ballY - this.ballR * 16) / CELL)) * CELL;
-    const y1 = Math.min(vh, Math.ceil(this.ballY + this.ballR * 16));
-    const x0 = this.hitDir === 1 ? Math.max(0, Math.floor((this.ballX - padX) / CELL)) * CELL : 0;
-    const x1 = this.hitDir === 1 ? PROC_W : Math.min(PROC_W, Math.ceil(this.ballX + padX));
-    this.gx0 = x0;
-    this.gy0 = y0;
-    this.gw = Math.max(CELL, x1 - x0);
-    this.gh = Math.max(CELL, y1 - y0);
-
+    // full-frame analysis: the ball can be placed anywhere in view
+    this.gx0 = 0;
+    this.gy0 = 0;
+    this.gw = PROC_W;
+    this.gh = vh;
     this.cols = Math.ceil(this.gw / CELL);
     this.rows = Math.ceil(this.gh / CELL);
     this.bg = new Float32Array(this.cols * this.rows).fill(-1);
 
-    // Protect the resting ball's footprint from background adaptation: without
-    // this, the running-average background slowly absorbs the white ball and
-    // the detector "forgets" it after a couple of seconds.
-    this.ballProtect = new Uint8Array(this.cols * this.rows);
-    const protR = this.ballR * 2.5;
-    const pxL = this.ballX - this.gx0;
-    const pyL = this.ballY - this.gy0;
-    for (let r = 0; r < this.rows; r++) {
-      const cellY = r * CELL + CELL / 2;
-      if (Math.abs(cellY - pyL) > protR) continue;
-      for (let c = 0; c < this.cols; c++) {
-        const cellX = c * CELL + CELL / 2;
-        if (Math.abs(cellX - pxL) <= protR) this.ballProtect[r * this.cols + c] = 1;
-      }
+    if (this.state === 'waiting') {
+      // cal position/size are just priors for the scan (where the user
+      // *intends* to place + expected ball size), not a hard requirement
+      this.ballX = cal.ballNX * PROC_W;
+      this.ballY = cal.ballNY * vh;
+      this.ballR = Math.max(3, cal.ballNR * vh);
+      this.ballProtect = new Uint8Array(this.cols * this.rows); // empty until locked
+    } else {
+      // keep the currently locked ball anchored; refresh its protection mask
+      this.rebuildBallProtect();
     }
   }
 
@@ -175,8 +179,11 @@ export class ShotDetector {
     this.state = 'waiting';
     this.points = [];
     this.candFrames = 0;
-    this.brightFrames = 0;
     this.goneFrames = 0;
+    this.shotDir = 1;
+    this.lockConfirmed = false;
+    this.goneStartVideoT = -1;
+    this.recStartVideoT = -1;
     this.staleFrames = 0;
     this.quietUntilWall = 0;
     if (this.bg.length) this.bg.fill(-1);
@@ -192,6 +199,7 @@ export class ShotDetector {
     if (!ctx || !this.canvas || !video.videoWidth || videoT === this.lastVideoT) return null;
     const dt = this.lastVideoT < 0 ? 1 / 60 : videoT - this.lastVideoT;
     this.lastVideoT = videoT;
+    this.lastWallT = wallT;
     shotFps.value = shotFps.value * 0.9 + (1 / dt) * 0.1;
 
     ctx.drawImage(
@@ -203,11 +211,11 @@ export class ShotDetector {
 
     switch (this.state) {
       case 'waiting': {
-        this.stepWaiting(grid);
+        this.stepWaiting(grid, wallT);
         break;
       }
       case 'armed': {
-        return this.stepArmed(grid, wallT);
+        return this.stepArmed(grid, videoT, wallT);
       }
       case 'recording': {
         return this.stepRecording(grid, videoT, wallT);
@@ -230,7 +238,7 @@ export class ShotDetector {
     this.candFrames = 0;
     this.lastCandX = -1;
     this.lastCandY = -1;
-    this.lastCandArea = 0;
+    this.candR = 0;
   }
 
   private expectedBallArea(): number {
@@ -239,56 +247,59 @@ export class ShotDetector {
     return Math.max(1, d * d);
   }
 
-  private stepWaiting(grid: Float32Array) {
-    // freeze: never let the running-average background eat the placed ball
-    const comps = this.findComponents(grid, true);
-    const expected = this.expectedBallArea();
-    let cand: Component | null = null;
-    for (const c of comps) {
-      const inZone =
-        Math.hypot(c.cx - this.ballX, c.cy - this.ballY) <= this.ballR * 2.6;
-      if (!inZone) continue;
-      const ratio = c.cells / expected;
-      if (ratio < 0.25 || ratio > 2.6) continue;
-      if (!cand || c.cells > cand.cells) cand = c;
-    }
-
-    // Template-free fallback: a white ball on turf/mat is a bright disc on a
-    // darker ring. This finds a ball that was ALREADY on the tee when the
-    // detector started scanning — it can never appear as a background diff.
-    const bright = this.brightBallAtSpot(grid);
-    if (bright) this.brightFrames++; else this.brightFrames = 0;
-
-    if (cand) {
-      if (
-        this.lastCandX >= 0 &&
-        Math.hypot(cand.cx - this.lastCandX, cand.cy - this.lastCandY) < this.ballR * 0.4 &&
-        Math.abs(cand.cells - this.lastCandArea) / Math.max(1, this.lastCandArea) < 0.55
-      ) {
-        this.candFrames++;
-      } else {
-        this.candFrames = 1;
+  /** Rebuild the protection mask for the current anchored ball position. */
+  private rebuildBallProtect() {
+    this.ballProtect = new Uint8Array(this.cols * this.rows);
+    const protR = this.ballR * 2.5;
+    const pxL = this.ballX - this.gx0;
+    const pyL = this.ballY - this.gy0;
+    for (let r = 0; r < this.rows; r++) {
+      const cellY = r * CELL + CELL / 2;
+      if (Math.abs(cellY - pyL) > protR) continue;
+      for (let c = 0; c < this.cols; c++) {
+        const cellX = c * CELL + CELL / 2;
+        if (Math.abs(cellX - pxL) <= protR) this.ballProtect[r * this.cols + c] = 1;
       }
-      this.lastCandX = cand.cx;
-      this.lastCandY = cand.cy;
-      this.lastCandArea = cand.cells;
-    } else {
-      this.resetCandidate();
-      // adapt slowly while waiting, but only when the zone is quiet — and
-      // never blend the resting ball into the background
-      this.adaptBackground(grid, 0.06, true);
-    }
-
-    if (this.candFrames >= 10 || (bright && this.brightFrames >= 10)) {
-      this.armBall(grid);
     }
   }
 
+  private stepWaiting(grid: Float32Array, wallT: number) {
+    // free placement: scan the whole frame for a bright ball-sized disc
+    const cand = this.scanBallCandidate(grid);
+    let stable = false;
+    if (cand) {
+      stable =
+        this.lastCandX >= 0 &&
+        Math.hypot(cand.cx - this.lastCandX, cand.cy - this.lastCandY) < Math.max(3, cand.r * 0.7) &&
+        Math.abs(cand.r - this.candR) <= Math.max(1, this.candR * 0.35);
+      this.candFrames = stable ? this.candFrames + 1 : 1;
+      this.lastCandX = cand.cx;
+      this.lastCandY = cand.cy;
+      this.candR = cand.r;
+    } else {
+      this.resetCandidate();
+    }
+
+    if (stable && this.candFrames >= 10 && cand) {
+      this.ballX = cand.cx;
+      this.ballY = cand.cy;
+      this.ballR = Math.max(3, cand.r);
+      this.rebuildBallProtect();
+      this.armBall(grid, wallT);
+    }
+  }
+
+  /** True once the ball has held its spot long enough to accept hits. */
+  isLockConfirmed(): boolean {
+    return this.lockConfirmed;
+  }
+
   /** Arm on a confirmed ball: seed the whole frame (ball included) as armed bg. */
-  private armBall(grid: Float32Array) {
+  private armBall(grid: Float32Array, wallT: number) {
     this.seedBackground(grid);
     this.state = 'armed';
-    this.armedAtWall = performance.now();
+    this.armedAtWall = wallT;
+    this.lockConfirmed = false;
     this.goneFrames = 0;
     this.resetCandidate();
     this.onEvent({ type: 'ballDetected' });
@@ -312,6 +323,123 @@ export class ShotDetector {
     }
     if (best === null) return false;
     return best - ringAvg > 40 && best > 90; // bright disc + contrast
+  }
+
+  /**
+   * Scan the whole frame for a bright ball-sized disc on a uniformly darker
+   * ring. Uses a summed-area table so every candidate window is O(1):
+   * candidate positions on a 4px lattice × candidate radii, then the winner
+   * is verified (and its radius refined) with exact disc/ring averages.
+   */
+  private scanBallCandidate(grid: Float32Array): { cx: number; cy: number; r: number } | null {
+    const W = this.cols + 1;
+    const sat = this.satBuf.length === W * (this.rows + 1) ? this.satBuf : new Float32Array(W * (this.rows + 1));
+    this.satBuf = sat;
+    for (let c = 0; c < W; c++) sat[c] = 0;
+    for (let r = 0; r < this.rows; r++) {
+      sat[(r + 1) * W] = 0;
+      let rowSum = 0;
+      for (let c = 0; c < this.cols; c++) {
+        rowSum += grid[r * this.cols + c];
+        sat[(r + 1) * W + c + 1] = sat[r * W + c + 1] + rowSum;
+      }
+    }
+    const boxSum = (r0: number, r1: number, c0: number, c1: number) =>
+      sat[(r1 + 1) * W + c1 + 1] - sat[r0 * W + c1 + 1] - sat[(r1 + 1) * W + c0] + sat[r0 * W + c0];
+
+    const RADIIS = [4, 6, 8, 10, 12, 14]; // px
+    let best: { cx: number; cy: number; r: number; score: number } | null = null;
+    for (const rpx of RADIIS) {
+      const half = Math.max(1, Math.round(rpx / CELL)); // disk half-window (cells)
+      const ringTop = Math.round(half * 1.9);           // ring outer half (cells)
+      for (let cr = ringTop; cr < this.rows - ringTop; cr++) {
+        for (let cc = ringTop; cc < this.cols - ringTop; cc++) {
+          const innerArea = (2 * half) * (2 * half);
+          const outerArea = (2 * ringTop) * (2 * ringTop);
+          const diskAvg = boxSum(cr - half, cr + half - 1, cc - half, cc + half - 1) / innerArea;
+          const ringSum =
+            boxSum(cr - ringTop, cr + ringTop - 1, cc - ringTop, cc + ringTop - 1) -
+            boxSum(cr - half, cr + half - 1, cc - half, cc + half - 1);
+          const ringAvg = ringSum / (outerArea - innerArea);
+          // the ball's surrounding must be uniformly darker — this rejects
+          // bright-background edges (wall/floor lines, shoe silhouettes)
+          const topSum = boxSum(cr - ringTop, cr - half - 1, cc - ringTop, cc + ringTop - 1);
+          const botSum = boxSum(cr + half, cr + ringTop - 1, cc - ringTop, cc + ringTop - 1);
+          const bandArea = (ringTop - half) * (2 * ringTop);
+          const uniform = Math.abs(topSum / bandArea - botSum / bandArea) < 26;
+          if (!uniform) continue;
+          const score = diskAvg - ringAvg;
+          // slight bias toward the calibrated spot (the user's intent)
+          const bx = cc * CELL + CELL / 2;
+          const by = cr * CELL + CELL / 2;
+          const biased = score + (Math.hypot(bx - this.ballX, by - this.ballY) < this.ballR * 4 && diskAvg > 90 ? 15 : 0);
+          if (biased > 40 && (!best || biased > best.score)) {
+            best = { cx: bx, cy: by, r: rpx, score: biased };
+          }
+        }
+      }
+    }
+    if (!best) return null;
+
+    // verify + measure the true radius by bright-area counting: the number of
+    // cell centers above the disc/ring midpoint inside a probe window differs
+    // from the disc area by a known factor for a circular disc, so
+    //   n*CELL^2 = pi*r^2  ->  r = sqrt(n*CELL^2/pi)
+    const px = best.cx;
+    const py = best.cy;
+    const disk = this.avgCellsAround(grid, best.r * 1.2, 0, py, px);
+    const ring = this.avgCellsAround(grid, best.r * 2.8, best.r * 1.7, py, px);
+    if (disk === null || ring === null) return null;
+    if (disk - ring < 40) return null;
+    const mid = ring + 0.5 * (disk - ring);
+    const probe = Math.min(3.2 * best.r, 40);
+    const cyL = py - this.gy0;
+    const cxL = px - this.gx0;
+    const win = Math.ceil(probe / CELL) + 1;
+    const row0 = Math.max(0, Math.floor(cyL / CELL) - win);
+    const row1 = Math.min(this.rows - 1, Math.ceil(cyL / CELL) + win);
+    const col0 = Math.max(0, Math.floor(cxL / CELL) - win);
+    const col1 = Math.min(this.cols - 1, Math.ceil(cxL / CELL) + win);
+    let n = 0;
+    for (let ri = row0; ri <= row1; ri++) {
+      for (let ci = col0; ci <= col1; ci++) {
+        // local coords in px relative to the ball center
+        const lx = ci * CELL + CELL / 2 - cxL;
+        const ly = ri * CELL + CELL / 2 - cyL;
+        if (lx * lx + ly * ly > probe * probe) continue;
+        // the grid starts at gy0/gx0; keep it a local full-frame index grid
+        if (grid[ri * this.cols + ci] > mid) n++;
+      }
+    }
+    const rMeasured = Math.sqrt((n * CELL * CELL) / Math.PI);
+    const r = Math.min(24, Math.max(3, rMeasured));
+    return { cx: px, cy: py, r };
+  }
+
+  /** count motion-active cells within ballR*2.4 of the spot (early exit at `needed`) */
+  private activeCellsNearSpot(grid: Float32Array, needed: number): number {
+    const r = this.ballR * 2.4;
+    const win = Math.ceil(r / CELL) + 1;
+    const cyL = this.ballY - this.gy0;
+    const cxL = this.ballX - this.gx0;
+    const row0 = Math.max(0, Math.floor(cyL / CELL) - win);
+    const row1 = Math.min(this.rows - 1, Math.ceil(cyL / CELL) + win);
+    const col0 = Math.max(0, Math.floor(cxL / CELL) - win);
+    const col1 = Math.min(this.cols - 1, Math.ceil(cxL / CELL) + win);
+    const th = this.threshold;
+    let count = 0;
+    for (let ri = row0; ri <= row1; ri++) {
+      for (let ci = col0; ci <= col1; ci++) {
+        const b = ri * this.cols + ci;
+        if (this.bg[b] < 0) continue;
+        if (Math.hypot(ci * CELL + CELL / 2 - cxL, ri * CELL + CELL / 2 - cyL) > r) continue;
+        if (Math.abs(grid[b] - this.bg[b]) > th) {
+          count++;
+          if (count >= needed) return count;
+        }
+      }
+    }
+    return count;
   }
 
   /** average luminance of cells whose center lies within [r0, r1] of (cy, cx) */
@@ -344,10 +472,19 @@ export class ShotDetector {
     return cnt > 0 ? sum / cnt : null;
   }
 
-  private stepArmed(grid: Float32Array, wallT: number): DetectorEvent | null {
+  private stepArmed(grid: Float32Array, videoT: number, wallT: number): DetectorEvent | null {
     if (wallT - this.armedAtWall > 60_000) {
       this.resetToWaiting();
       return { type: 'armedTimeout' };
+    }
+
+    // after the ball holds its spot for LOCK_CONFIRM_MS, departures count as
+    // hits even without a full flight track (30fps phones simply can't track
+    // fast balls long enough)
+    if (!this.lockConfirmed && wallT - this.armedAtWall >= LOCK_CONFIRM_MS) {
+      this.lockConfirmed = true;
+      this.onEvent({ type: 'lockConfirmed' });
+      return null;
     }
 
     // right after a false trigger (hand/body crossing the zone) hold still for
@@ -372,6 +509,7 @@ export class ShotDetector {
     }
 
     const expected = this.expectedBallArea();
+    const goneCells = expected * 0.5;
 
     // fast motion near the ball => shot in progress
     if (!bigSceneChange) {
@@ -384,24 +522,21 @@ export class ShotDetector {
           dyRange < this.ballR * 5 &&
           c.cells >= expected * 0.4
         ) {
-          this.beginRecording(wallT, 'motion');
+          this.beginRecording(wallT, 'motion', videoT);
           return null;
         }
       }
     }
 
     // otherwise: did the ball vanish from its spot?
-    let gone = 0;
-    for (const c of comps) {
-      if (Math.hypot(cx(c) - this.ballX, c.cy - this.ballY) <= this.ballR * 2.4) {
-        gone += c.cells;
-      }
-    }
-    const goneCells = expected * 0.5;
+    // (count motion cells near the spot itself — a leaving ball's streak is
+    // still connected to the spot for a frame, so blob centroids mislead)
+    const gone = this.activeCellsNearSpot(grid, goneCells);
     if (gone >= goneCells) {
+      if (this.goneFrames === 0) this.goneStartVideoT = videoT; // first changed frame
       this.goneFrames++;
       if (this.goneFrames >= 2) {
-        this.beginRecording(wallT, 'gone');
+        this.beginRecording(wallT, 'gone', videoT);
         return null;
       }
     } else {
@@ -413,11 +548,12 @@ export class ShotDetector {
     return null;
   }
 
-  private beginRecording(wallT: number, by: 'motion' | 'gone') {
+  private beginRecording(wallT: number, by: 'motion' | 'gone', videoT: number) {
     this.state = 'recording';
     this.triggeredBy = by;
-    this.points = [];
+    this.recStartVideoT = videoT;
     this.recStartWall = wallT;
+    this.points = [];
     this.staleFrames = 0;
     this.goneFrames = 0;
   }
@@ -434,8 +570,21 @@ export class ShotDetector {
       // upper bound is generous: motion blur spreads a fast ball into a long
       // streak (a 30+ m/s ball paints many times the resting-ball area)
       if (c.cells < expected * 0.18 || c.cells > expected * 40) continue;
-      const dxRange = (c.cx - this.ballX) * this.hitDir;
-      if (dxRange < this.ballR * 1.1) continue;
+      if (this.points.length === 0) {
+        // first flight point: accept ANY direction (the calibrated arrow is
+        // only a hint). The trigger already consumed the frame where the ball
+        // left the spot, so by now a fast ball's streak is 1-2 frames of
+        // flight away — allow generous reach, the second point's speed gate
+        // (and for gone-triggers the departure estimator) does the filtering.
+        const dist0 = Math.hypot(cx(c) - this.ballX, c.cy - this.ballY);
+        if (dist0 <= this.ballR * 1.1 || dist0 > this.ballR * 40) continue;
+        // reject geometry that no struck ball produces: farther below the
+        // spot's line than outward
+        if (c.cy - this.ballY > 0.9 * dist0) continue;
+      } else {
+        // later blobs must stay on the side the flight actually went
+        if ((cx(c) - this.ballX) * this.shotDir < this.ballR * 1.1) continue;
+      }
       if (!best) { best = c; continue; }
       const ref = last ?? { x: this.ballX, y: this.ballY };
       if (Math.hypot(cx(c) - ref.x, c.cy - ref.y) < Math.hypot(cx(best) - ref.x, best.cy - ref.y)) {
@@ -446,16 +595,20 @@ export class ShotDetector {
     let advanced = false;
     if (best) {
       if (!last) {
-        this.points.push({ t: videoT, x: best.cx, y: best.cy });
+        this.points.push({ t: videoT, x: cx(best), y: best.cy });
         advanced = true;
       } else {
-        const dx = best.cx - last.x;
+        const dx = cx(best) - last.x;
         const dy = best.cy - last.y;
         const dtF = videoT - last.t;
         if (dtF > 0) {
           const dpx = Math.hypot(dx, dy);
           const speedMps = dpx / dtF / pxPerMeter;
-          const dirOk = dx * this.hitDir > 0;
+          if (this.points.length === 1) {
+            // first pair: the flight's own motion fixes its direction
+            this.shotDir = dx >= 0 ? 1 : -1;
+          }
+          const dirOk = dx * this.shotDir > 0;
           // distance cap is the whole view: a real ball at 30-70 m/s jumps
           // 100+ px per frame, anything tighter would reject every shot
           if (dirOk && speedMps > this.opts.minSpeedMps && speedMps < this.opts.maxSpeedMps && dpx < PROC_W) {
@@ -472,17 +625,29 @@ export class ShotDetector {
     if (this.staleFrames >= 4 || this.points.length >= 24 || elapsed > 1500) {
       if (this.points.length >= 2) return this.finishShot();
 
-      // 0-1 points is never a shot. Decide what actually moved:
-      // a lone point's distance from the spot implies a speed — ball-like
-      // means a real (untrackable) hit, slow means a hand/body/pickup.
+      // 0-1 points is never a track. Estimate what actually moved:
+      // a lone point's distance from the spot since the departure implies a
+      // speed — ball-like means a real (partially tracked) hit.
+      const dtStart = this.triggeredBy === 'gone' ? this.goneStartVideoT : this.recStartVideoT;
       const p0 = this.points[0];
       let impliedMps = 0;
       if (p0) {
-        const dpx = Math.hypot(p0.x - this.ballX, p0.y - this.ballY);
-        impliedMps = dpx / (pxPerMeter * Math.max(1e-3, elapsed / 1000));
+        // the ball left ~1 frame BEFORE the spot change was first registered
+        const fps = Math.max(10, shotFps.value || 30);
+        const departureT = dtStart - 1 / fps;
+        const dt = p0.t - departureT;
+        if (dt > 1e-3) {
+          impliedMps = Math.hypot(p0.x - this.ballX, p0.y - this.ballY) / pxPerMeter / dt;
+        }
       }
-      if (impliedMps >= this.opts.minSpeedMps) {
-        return this.finishShot(); // => shotDisqualified with a visible message
+      if (p0 && impliedMps >= this.opts.minSpeedMps) {
+        if (this.triggeredBy === 'gone') {
+          // ball-like departure from its known spot: a real (partially
+          // tracked) hit — estimate metrics
+          return this.finishDepartureShot(pxPerMeter);
+        }
+        // motion-triggered: a single blob can't be trusted, stay armed
+        return this.abortRecordingToArmed(wallT);
       }
       if (this.triggeredBy === 'gone') {
         // the ball left its spot with no ball-like motion: it was picked up,
@@ -497,12 +662,38 @@ export class ShotDetector {
     return null;
   }
 
+  /**
+   * A confirmed hit whose flight we only caught in one frame (30fps phones).
+   * Speed is estimated from the streak's displacement since the spot change,
+   * launch angle from its direction — practice-grade, not lab-grade.
+   */
+  private finishDepartureShot(pxPerMeter: number): DetectorEvent {
+    const p0 = this.points[0];
+    const pointsSnapshot = this.points.slice();
+    this.points = [];
+    this.state = 'cooldown';
+    this.cooldownUntilWall = this.lastWallT + 1100;
+    if (this.bg.length) this.bg.fill(-1); // ball is gone: re-seed background
+    const fps = Math.max(10, shotFps.value || 30);
+    const dtStart = this.triggeredBy === 'gone' ? this.goneStartVideoT : this.recStartVideoT;
+    const departureT = dtStart - 1 / fps;
+    const dt = Math.max(1e-3, p0.t - departureT);
+    const raw = Math.hypot(p0.x - this.ballX, p0.y - this.ballY) / pxPerMeter / dt;
+    const speed = Math.min(this.opts.maxSpeedMps, Math.max(this.opts.minSpeedMps, raw));
+    const dirDx = Math.abs(p0.x - this.ballX); // forward component is direction-independent
+    const dirDyUp = -(p0.y - this.ballY);
+    const launchDeg = Math.min(70, Math.max(-25, Math.atan2(dirDyUp, dirDx) * (180 / Math.PI)));
+    return { type: 'shot', metrics: { ballSpeedMps: speed, launchDeg, trackCount: 1 }, points: pointsSnapshot };
+  }
+
   /** False trigger (motion without ball-like track): quietly return to armed. */
   private abortRecordingToArmed(wallT: number): DetectorEvent {
     this.state = 'armed';
     this.points = [];
     this.staleFrames = 0;
     this.goneFrames = 0;
+    // if the 3s lock-confirmation hadn't finished yet, restart its timer
+    if (!this.lockConfirmed) this.armedAtWall = wallT;
     this.quietUntilWall = wallT + ABORT_QUIET_MS;
     return { type: 'trackAborted', reason: 'no-ball-motion' };
   }
@@ -511,7 +702,7 @@ export class ShotDetector {
     const pts = this.points;
     this.points = [];
     this.state = 'cooldown';
-    this.cooldownUntilWall = performance.now() + 1100;
+    this.cooldownUntilWall = this.lastWallT + 1100;
     // the ball has left: the background no longer describes the scene
     // (protected spot cells still show the ball). Wipe so the cooldown
     // re-seeds from the real current frame.
@@ -528,7 +719,9 @@ export class ShotDetector {
       const dtS = Math.max(1e-3, pts[i].t - pts[i - 1].t);
       speeds.push(Math.hypot(dx, dy) / dtS / pxPerMeter);
       // launch angle: displacement above horizontal, in flight direction
-      const dirDx = dx * this.hitDir;
+      // (direction-independent: |dx| as the forward component — the flight
+      // direction is already enforced by the shotDir gate on tracking)
+      const dirDx = Math.abs(dx);
       const dirDyUp = -dy;
       angles.push(Math.atan2(dirDyUp, dirDx) * (180 / Math.PI));
     }

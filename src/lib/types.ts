@@ -30,7 +30,8 @@ export interface ShotMetrics {
 }
 
 export type DetectorEvent =
-  | { type: 'ballDetected' }          // ball placed & stable -> armed
+  | { type: 'ballDetected' }          // ball spotted -> confirming (3s hold)
+  | { type: 'lockConfirmed' }         // ball held still, position locked -> hit-ready
   | { type: 'armedTimeout' }          // armed but no shot for a while -> standby again
   | { type: 'trackAborted'; reason: 'no-ball-motion' | 'ball-removed' }
                                       // non-ball motion (hand/body/club) triggered

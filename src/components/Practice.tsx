@@ -11,7 +11,8 @@ interface Props {
   patch: (p: Partial<Settings>) => void;
   onOpenSetup: () => void;
 }const STATE_TEXT: Record<string, string> = {
-  waiting: 'Place the ball in the circle…',
+  waiting: 'Place the ball anywhere in view — it locks automatically…',
+  arming: 'Confirming ball — hold still…',
   armed: 'BALL LOCKED — swing away',
   recording: 'Capturing…',
   cooldown: 'Processing…'
@@ -171,6 +172,12 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
         setStatus(STATE_TEXT[det.state] ?? det.state);
         setStatusKind(det.state as typeof statusKind);
       }
+      // arming has an extra phase (3s hold -> beep) only visible in the text
+      const stateKey = det.state === 'armed' && det.isLockConfirmed() ? 'armed' : det.state === 'armed' ? 'arming' : det.state;
+      if (stateKey !== stateRef.current) {
+        stateRef.current = stateKey;
+        setStatus(STATE_TEXT[stateKey] ?? stateKey);
+      }
       drawOverlay();
     };
     raf = requestAnimationFrame(loop);
@@ -199,8 +206,10 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
 
   function handleDetectorEvent(e: Parameters<ShotDetector['onEvent']>[0]) {
     if (e.type === 'ballDetected') {
-      beep(1); // locked & ready for the swing
+      // no beep yet — the lock is confirmed only after the 3s hold
       startRecorder();
+    } else if (e.type === 'lockConfirmed') {
+      beep(1); // position locked — swing away
     } else if (e.type === 'armedTimeout') {
       stopRecorder(false, () => {});
       showToast('Armed timed out — waiting for a new ball.', 2500);
@@ -455,8 +464,8 @@ function ShotCardPlaceholder() {
       <p>No shots yet.</p>
       <p className="hint">
         1. Set the phone ~0.5–1 m to the side of the ball, at ball height.
-        <br />2. Place a clean painting-taped or marked ball in the circle.
-        <br />3. The app locks on and records your swing automatically.
+        <br />2. Place a clean painting-taped or marked ball anywhere in view.
+        <br />3. The app finds the ball anywhere in view, locks on and records your swing automatically.
       </p>
     </div>
   );
