@@ -91,9 +91,12 @@ export class ShotDetector {
   private lastCandX = -1;
   private lastCandY = -1;
   private lastCandArea = 0;
+  private brightFrames = 0;
 
   private armedAtWall = 0;
   private goneFrames = 0;
+  /** what fired the current recording: fast motion band or the spot-change signal */
+  private triggeredBy: 'motion' | 'gone' = 'motion';
 
   private points: TrackedPoint[] = [];
   private recStartWall = 0;
@@ -227,6 +230,7 @@ export class ShotDetector {
     this.lastCandX = -1;
     this.lastCandY = -1;
     this.lastCandArea = 0;
+    this.brightFrames = 0;
   }
 
   private expectedBallArea(): number {
@@ -249,6 +253,12 @@ export class ShotDetector {
       if (!cand || c.cells > cand.cells) cand = c;
     }
 
+    // Template-free fallback: a white ball on turf/mat is a bright disc on a
+    // darker ring. This finds a ball that was ALREADY on the tee when the
+    // detector started scanning — it can never appear as a background diff.
+    const bright = this.brightBallAtSpot(grid);
+    if (bright) this.brightFrames++; else this.brightFrames = 0;
+
     if (cand) {
       if (
         this.lastCandX >= 0 &&
@@ -262,21 +272,67 @@ export class ShotDetector {
       this.lastCandX = cand.cx;
       this.lastCandY = cand.cy;
       this.lastCandArea = cand.cells;
-
-      if (this.candFrames >= 10) {
-        this.seedBackground(grid);
-        this.state = 'armed';
-        this.armedAtWall = performance.now();
-        this.goneFrames = 0;
-        this.resetCandidate();
-        this.onEvent({ type: 'ballDetected' });
-      }
     } else {
       this.resetCandidate();
       // adapt slowly while waiting, but only when the zone is quiet — and
       // never blend the resting ball into the background
       this.adaptBackground(grid, 0.06, true);
     }
+
+    if (this.candFrames >= 10 || (bright && this.brightFrames >= 10)) {
+      this.armBall(grid);
+    }
+  }
+
+  /** Arm on a confirmed ball: seed the whole frame (ball included) as armed bg. */
+  private armBall(grid: Float32Array) {
+    this.seedBackground(grid);
+    this.state = 'armed';
+    this.armedAtWall = performance.now();
+    this.goneFrames = 0;
+    this.resetCandidate();
+    this.onEvent({ type: 'ballDetected' });
+  }
+
+  /**
+   * True when the ball disc is clearly brighter than the ring around it —
+   * a white/marked ball on turf or mat.
+   */
+  private brightBallAtSpot(grid: Float32Array): boolean {
+    const diskAvg = this.avgCellsAround(grid, this.ballR * 1.2, this.ballR * 0, this.ballY, this.ballX);
+    const ringAvg = this.avgCellsAround(grid, this.ballR * 2.8, this.ballR * 1.7, this.ballY, this.ballX);
+    if (diskAvg === null || ringAvg === null) return false;
+    return diskAvg - ringAvg > 40 && diskAvg > 90; // bright disc + contrast
+  }
+
+  /** average luminance of cells whose center lies within [r0, r1] of (cy, cx) */
+  private avgCellsAround(
+    grid: Float32Array,
+    r1: number,
+    r0: number,
+    cyAbs: number,
+    cxAbs: number
+  ): number | null {
+    let sum = 0;
+    let cnt = 0;
+    const ry = cyAbs - this.gy0;
+    const rx = cxAbs - this.gx0;
+    const maxR = Math.ceil(r1 / CELL) + 1;
+    const row0 = Math.max(0, Math.floor(ry / CELL) - maxR);
+    const row1 = Math.min(this.rows - 1, Math.ceil(ry / CELL) + maxR);
+    const col0 = Math.max(0, Math.floor(rx / CELL) - maxR);
+    const col1 = Math.min(this.cols - 1, Math.ceil(rx / CELL) + maxR);
+    for (let r = row0; r <= row1; r++) {
+      for (let c = col0; c <= col1; c++) {
+        const cellX = c * CELL + CELL / 2;
+        const cellY = r * CELL + CELL / 2;
+        const d = Math.hypot(cellX - rx, cellY - ry);
+        if (d < r0 || d > r1) continue;
+        sum += grid[r * this.cols + c];
+        cnt++;
+      }
+    }
+    return cnt > 0 ? sum / cnt : null;
   }
 
   private stepArmed(grid: Float32Array, wallT: number): DetectorEvent | null {
@@ -316,7 +372,7 @@ export class ShotDetector {
         dyRange < this.ballR * 5 &&
         c.cells >= expected * 0.4
       ) {
-        this.beginRecording(wallT);
+        this.beginRecording(wallT, 'motion');
         return null;
       }
     }
@@ -332,7 +388,7 @@ export class ShotDetector {
     if (gone >= goneCells) {
       this.goneFrames++;
       if (this.goneFrames >= 2) {
-        this.beginRecording(wallT);
+        this.beginRecording(wallT, 'gone');
         return null;
       }
     } else {
@@ -344,8 +400,9 @@ export class ShotDetector {
     return null;
   }
 
-  private beginRecording(wallT: number) {
+  private beginRecording(wallT: number, by: 'motion' | 'gone') {
     this.state = 'recording';
+    this.triggeredBy = by;
     this.points = [];
     this.recStartWall = wallT;
     this.staleFrames = 0;
@@ -402,14 +459,26 @@ export class ShotDetector {
     if (this.staleFrames >= 4 || this.points.length >= 24 || (elapsed > 1500 && this.points.length >= 2)) {
       if (this.points.length >= 2) return this.finishShot();
       if (this.points.length === 0 && elapsed < 900) {
-        // no ball-like motion at all: this was almost certainly a hand, body
-        // or club passing through the zone. Abandon silently and stay armed.
+        // no ball-like motion: the trigger came from a hand, body or club
+        if (this.triggeredBy === 'gone') {
+          // the ball was picked up / removed, not struck: start over so the
+          // next placement fresh-arms
+          this.resetToWaiting();
+          return { type: 'trackAborted', reason: 'ball-removed' };
+        }
+        // motion-triggered: some hand/body passed the band — stay armed
         return this.abortRecordingToArmed(wallT);
       }
       return this.finishShot(); // 1 point => disqualified with a visible message
     }
     if (elapsed > 1500 && this.points.length < 2) {
-      if (this.points.length === 0) return this.abortRecordingToArmed(wallT);
+      if (this.points.length === 0) {
+        if (this.triggeredBy === 'gone') {
+          this.resetToWaiting();
+          return { type: 'trackAborted', reason: 'ball-removed' };
+        }
+        return this.abortRecordingToArmed(wallT);
+      }
       this.state = 'cooldown';
       this.cooldownUntilWall = wallT + 1000;
       this.points = [];
@@ -426,7 +495,7 @@ export class ShotDetector {
     this.staleFrames = 0;
     this.goneFrames = 0;
     this.quietUntilWall = wallT + ABORT_QUIET_MS;
-    return { type: 'trackAborted' };
+    return { type: 'trackAborted', reason: 'no-ball-motion' };
   }
 
   private finishShot(): DetectorEvent | null {
@@ -532,9 +601,16 @@ export class ShotDetector {
   private adaptBackground(grid: Float32Array, rate: number, protect = false) {
     const n = grid.length;
     for (let i = 0; i < n; i++) {
+      // unset cells must always be seeded, including protected ones — a cell
+      // that never got a value can never show motion (bg < 0 is skipped in
+      // findComponents)
+      if (this.bg[i] < 0) {
+        this.bg[i] = grid[i];
+        continue;
+      }
+      // after seeding, protected cells (the resting ball) never adapt
       if (protect && this.ballProtect[i]) continue;
-      if (this.bg[i] < 0) this.bg[i] = grid[i];
-      else this.bg[i] += (grid[i] - this.bg[i]) * rate;
+      this.bg[i] += (grid[i] - this.bg[i]) * rate;
     }
   }
 

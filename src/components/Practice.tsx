@@ -202,9 +202,11 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
       stopRecorder(false, () => {});
       showToast('Armed timed out — waiting for a new ball.', 2500);
     } else if (e.type === 'trackAborted') {
-      // hand/body triggered the capture but nothing ball-like was moving:
-      // quietly return to armed and keep the recorder rolling so clips still
-      // cover the next real swing (same as the normal armed behavior)
+      if (e.reason === 'ball-removed') {
+        stopRecorder(false, () => {});
+      }
+      // reason 'no-ball-motion' (hand/body/club passing) keeps the recorder
+      // rolling so clips still cover the next real swing
     } else if (e.type === 'shotDisqualified') {
       stopRecorder(false, () => {});
       showToast('Ball not tracked — place the ball and swing again.', 3000);
@@ -376,6 +378,9 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
             <div className="hud">
               <div className={`status-pill kind-${statusKind}`}>{status}</div>
               {fps > 0 && <div className="fps">{fps} fps · est.</div>}
+              <div className="ver">
+                v{__APP_VERSION__} · built {new Date(__BUILD_TS__).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+              </div>
             </div>
             {!camReady && <div className="cam-loading">Starting camera…</div>}
           </div>
