@@ -623,35 +623,37 @@ export class ShotDetector {
 
     const elapsed = wallT - this.recStartWall;
     if (this.staleFrames >= 4 || this.points.length >= 24 || elapsed > 1500) {
-      if (this.points.length >= 2) return this.finishShot();
+      // Shots only count after the ball held its spot for LOCK_CONFIRM_MS and
+      // the lock beep sounded — before that, the ball moving means the user
+      // is still placing/pointing it, not swinging.
+      if (this.lockConfirmed) {
+        if (this.points.length >= 2) return this.finishShot();
 
-      // 0-1 points is never a track. Estimate what actually moved:
-      // a lone point's distance from the spot since the departure implies a
-      // speed — ball-like means a real (partially tracked) hit.
-      const dtStart = this.triggeredBy === 'gone' ? this.goneStartVideoT : this.recStartVideoT;
-      const p0 = this.points[0];
-      let impliedMps = 0;
-      if (p0) {
-        // the ball left ~1 frame BEFORE the spot change was first registered
-        const fps = Math.max(10, shotFps.value || 30);
-        const departureT = dtStart - 1 / fps;
-        const dt = p0.t - departureT;
-        if (dt > 1e-3) {
-          impliedMps = Math.hypot(p0.x - this.ballX, p0.y - this.ballY) / pxPerMeter / dt;
+        // 0-1 points is never a track. Estimate what actually moved:
+        // a lone point's distance from the spot since the departure implies a
+        // speed — ball-like means a real (partially tracked) hit.
+        const dtStart = this.triggeredBy === 'gone' ? this.goneStartVideoT : this.recStartVideoT;
+        const p0 = this.points[0];
+        let impliedMps = 0;
+        if (p0) {
+          // the ball left ~1 frame BEFORE the spot change was first registered
+          const fps = Math.max(10, shotFps.value || 30);
+          const departureT = dtStart - 1 / fps;
+          const dt = p0.t - departureT;
+          if (dt > 1e-3) {
+            impliedMps = Math.hypot(p0.x - this.ballX, p0.y - this.ballY) / pxPerMeter / dt;
+          }
         }
-      }
-      if (p0 && impliedMps >= this.opts.minSpeedMps) {
-        if (this.triggeredBy === 'gone') {
+        if (p0 && impliedMps >= this.opts.minSpeedMps && this.triggeredBy === 'gone') {
           // ball-like departure from its known spot: a real (partially
           // tracked) hit — estimate metrics
           return this.finishDepartureShot(pxPerMeter);
         }
-        // motion-triggered: a single blob can't be trusted, stay armed
-        return this.abortRecordingToArmed(wallT);
       }
       if (this.triggeredBy === 'gone') {
-        // the ball left its spot with no ball-like motion: it was picked up,
-        // not struck — start over so the next placement fresh-arms
+        // the ball left its spot with no confirmed lock (still being placed)
+        // or no ball-like motion (picked up, not struck): start over so the
+        // next placement fresh-arms
         this.resetToWaiting();
         return { type: 'trackAborted', reason: 'ball-removed' };
       }

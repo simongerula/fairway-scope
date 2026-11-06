@@ -50,11 +50,16 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
   settingsRef.current = settings;
 
   // beeps fire from camera callbacks, which iOS forbids unless the page has
-  // already had a user gesture — warm the AudioContext on first tap
+  // already had a user gesture — keep the AudioContext warm on every tap
+  // (iOS re-suspends it whenever the PWA is backgrounded)
   useEffect(() => {
     const h = () => warmupAudio();
-    window.addEventListener('pointerdown', h, { once: true });
-    return () => window.removeEventListener('pointerdown', h);
+    window.addEventListener('pointerdown', h);
+    window.addEventListener('touchstart', h, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', h);
+      window.removeEventListener('touchstart', h);
+    };
   }, []);
 
   // lives in a ref so the camera effect can call it and it always sees

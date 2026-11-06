@@ -199,8 +199,9 @@ console.log('E: real strike 40 m/s @ 10° -> shot with sane metrics');
 {
   const { det, events } = makeDetector();
   placeBall(0, 0);
-  step(det, events, 120);
+  step(det, events, 230); // past the 3s lock confirmation (armed ~0.2s in)
   expect(det.state === 'armed', 'armed first');
+  expect(events.some((e) => e.type === 'lockConfirmed'), 'lock confirmed before the strike');
   // 40 m/s at 60 fps, 10° launch
   const speedPx = (40 * (BALL_R / 0.04267)) / FPS; // ~118 px/frame
   for (let i = 0; i < 40; i++) {
@@ -227,8 +228,9 @@ console.log('F: soft chip 12 m/s -> shot');
 {
   const { det, events } = makeDetector();
   placeBall(0, 0);
-  step(det, events, 120);
+  step(det, events, 230); // past the 3s lock confirmation
   expect(det.state === 'armed', 'armed first');
+  expect(events.some((e) => e.type === 'lockConfirmed'), 'lock confirmed before the chip');
   const speedPx = (12 * (BALL_R / 0.04267)) / FPS; // ~35 px/frame
   for (let i = 0; i < 40; i++) {
     ball.px = ball.x; ball.py = ball.y;
@@ -308,6 +310,46 @@ console.log('I: removal before lock confirmation -> no shot');
   removeBall();
   step(det, events, 60);
   expect(!events.some((e) => e.type === 'shot'), 'no shot before lock confirmation');
+}
+
+// scenario J: ball placed ~1s then moved quickly (their exact report) -> no
+// shot, detector re-scans and re-locks at the moved position ------------------
+console.log('J: quick ball move before the beep -> no shot, re-locks at new spot');
+{
+  const { det, events } = makeDetector();
+  placeBall(0, 0);
+  step(det, events, 60); // only 1s < LOCK_CONFIRM_MS
+  expect(!events.some((e) => e.type === 'lockConfirmed'), 'not confirmed yet');
+  const spotX = det.zoneGeometry().ballX;
+  // move the ball quickly down-right (still plainly visible): 3 fast frames
+  const movePerFrame = (12 * (BALL_R / 0.04267)) / FPS;
+  for (let i = 0; i < 3; i++) {
+    ball.px = ball.x; ball.py = ball.y;
+    ball.x += movePerFrame * 2;
+    ball.y += movePerFrame * 0.5;
+    step(det, events, 1);
+  }
+  ball.px = ball.x; ball.py = ball.y;
+  step(det, events, 80); // ball now resting elsewhere: departure resolves
+  expect(!events.some((e) => e.type === 'shot'), 'no shot from a pre-beep ball move');
+  // re-lock at the moved position, then a departure counts again
+  step(det, events, 230);
+  expect(events.some((e) => e.type === 'lockConfirmed'), 're-locked at the moved position');
+  const movedX = det.zoneGeometry().ballX;
+  expect(movedX > spotX + 50, `lock moved to the new resting spot (${spotX.toFixed(0)} -> ${movedX.toFixed(0)})`);
+  // strike: horizontal fast departure, still in frame for 2 frames
+  for (let i = 0; i < 40; i++) {
+    ball.px = ball.x; ball.py = ball.y;
+    ball.x += movePerFrame * 2;
+    step(det, events, 1);
+  }
+  step(det, events, 40);
+  const shot = events.find((e) => e.type === 'shot') as { type: 'shot'; metrics: { ballSpeedMps: number } } | undefined;
+  expect(!!shot, 'departure after re-lock counts as a shot');
+  if (shot) {
+    console.log(`       recorded speed=${shot.metrics.ballSpeedMps.toFixed(1)} m/s (moved ~24 m/s)`);
+    expect(shot.metrics.ballSpeedMps > 6 && shot.metrics.ballSpeedMps < 40, `plausible estimate (${shot.metrics.ballSpeedMps.toFixed(1)})`);
+  }
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
