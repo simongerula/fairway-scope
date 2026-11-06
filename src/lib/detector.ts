@@ -48,7 +48,7 @@ export interface DetectorOptions {
   maxSpeedMps: number;
 }
 
-const DEFAULT_OPTS: DetectorOptions = { minSpeedMps: 4, maxSpeedMps: 110 };
+const DEFAULT_OPTS: DetectorOptions = { minSpeedMps: 8, maxSpeedMps: 110 };
 
 /** after arming, hold triggers this long so the hand leaving the ball doesn't fire */
 const QUIET_HOLD_MS = 250;
@@ -175,6 +175,7 @@ export class ShotDetector {
     this.state = 'waiting';
     this.points = [];
     this.candFrames = 0;
+    this.brightFrames = 0;
     this.goneFrames = 0;
     this.staleFrames = 0;
     this.quietUntilWall = 0;
@@ -230,7 +231,6 @@ export class ShotDetector {
     this.lastCandX = -1;
     this.lastCandY = -1;
     this.lastCandArea = 0;
-    this.brightFrames = 0;
   }
 
   private expectedBallArea(): number {
@@ -295,14 +295,23 @@ export class ShotDetector {
   }
 
   /**
-   * True when the ball disc is clearly brighter than the ring around it —
-   * a white/marked ball on turf or mat.
+   * True when a ball-sized disc clearly brighter than the surrounding ring
+   * sits near the calibrated spot. The disc is searched over small offsets so
+   * a slightly off-center placement still counts.
    */
   private brightBallAtSpot(grid: Float32Array): boolean {
-    const diskAvg = this.avgCellsAround(grid, this.ballR * 1.2, this.ballR * 0, this.ballY, this.ballX);
     const ringAvg = this.avgCellsAround(grid, this.ballR * 2.8, this.ballR * 1.7, this.ballY, this.ballX);
-    if (diskAvg === null || ringAvg === null) return false;
-    return diskAvg - ringAvg > 40 && diskAvg > 90; // bright disc + contrast
+    if (ringAvg === null) return false;
+    let best: number | null = null;
+    const step = this.ballR * 0.6;
+    for (let oy = -this.ballR * 1.2; oy <= this.ballR * 1.2 + 1e-6; oy += step) {
+      for (let ox = -this.ballR * 1.2; ox <= this.ballR * 1.2 + 1e-6; ox += step) {
+        const diskAvg = this.avgCellsAround(grid, this.ballR * 1.1, 0, this.ballY + oy, this.ballX + ox);
+        if (diskAvg !== null && (best === null || diskAvg > best)) best = diskAvg;
+      }
+    }
+    if (best === null) return false;
+    return best - ringAvg > 40 && best > 90; // bright disc + contrast
   }
 
   /** average luminance of cells whose center lies within [r0, r1] of (cy, cx) */
@@ -456,33 +465,29 @@ export class ShotDetector {
     this.staleFrames = advanced ? 0 : this.staleFrames + 1;
 
     const elapsed = wallT - this.recStartWall;
-    if (this.staleFrames >= 4 || this.points.length >= 24 || (elapsed > 1500 && this.points.length >= 2)) {
+    if (this.staleFrames >= 4 || this.points.length >= 24 || elapsed > 1500) {
       if (this.points.length >= 2) return this.finishShot();
-      if (this.points.length === 0 && elapsed < 900) {
-        // no ball-like motion: the trigger came from a hand, body or club
-        if (this.triggeredBy === 'gone') {
-          // the ball was picked up / removed, not struck: start over so the
-          // next placement fresh-arms
-          this.resetToWaiting();
-          return { type: 'trackAborted', reason: 'ball-removed' };
-        }
-        // motion-triggered: some hand/body passed the band — stay armed
-        return this.abortRecordingToArmed(wallT);
+
+      // 0-1 points is never a shot. Decide what actually moved:
+      // a lone point's distance from the spot implies a speed — ball-like
+      // means a real (untrackable) hit, slow means a hand/body/pickup.
+      const p0 = this.points[0];
+      let impliedMps = 0;
+      if (p0) {
+        const dpx = Math.hypot(p0.x - this.ballX, p0.y - this.ballY);
+        impliedMps = dpx / (pxPerMeter * Math.max(1e-3, elapsed / 1000));
       }
-      return this.finishShot(); // 1 point => disqualified with a visible message
-    }
-    if (elapsed > 1500 && this.points.length < 2) {
-      if (this.points.length === 0) {
-        if (this.triggeredBy === 'gone') {
-          this.resetToWaiting();
-          return { type: 'trackAborted', reason: 'ball-removed' };
-        }
-        return this.abortRecordingToArmed(wallT);
+      if (impliedMps >= this.opts.minSpeedMps) {
+        return this.finishShot(); // => shotDisqualified with a visible message
       }
-      this.state = 'cooldown';
-      this.cooldownUntilWall = wallT + 1000;
-      this.points = [];
-      return { type: 'shotDisqualified', reason: 'no-ball-track' };
+      if (this.triggeredBy === 'gone') {
+        // the ball left its spot with no ball-like motion: it was picked up,
+        // not struck — start over so the next placement fresh-arms
+        this.resetToWaiting();
+        return { type: 'trackAborted', reason: 'ball-removed' };
+      }
+      // motion-triggered (fast blob passed the band): hand/body/club — stay armed
+      return this.abortRecordingToArmed(wallT);
     }
     this.adaptBackground(grid, 0.015);
     return null;
@@ -503,6 +508,10 @@ export class ShotDetector {
     this.points = [];
     this.state = 'cooldown';
     this.cooldownUntilWall = performance.now() + 1100;
+    // the ball has left: the background no longer describes the scene
+    // (protected spot cells still show the ball). Wipe so the cooldown
+    // re-seeds from the real current frame.
+    if (this.bg.length) this.bg.fill(-1);
     if (pts.length < 2) {
       return { type: 'shotDisqualified', reason: 'no-ball-track' };
     }

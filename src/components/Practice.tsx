@@ -161,7 +161,10 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
         det.configure(cal, v.videoWidth, v.videoHeight, settingsRef.current.sensitivity);
       }
 
-      det.update(v, v.currentTime, performance.now());
+      const ev = det.update(v, v.currentTime, performance.now());
+      // armed/recording events are RETURNED by update() (ballDetected comes
+      // through det.onEvent instead) — discarding this kills every shot
+      if (ev) eventHandlerRef.current(ev);
 
       if (det.state !== stateRef.current) {
         stateRef.current = det.state;
