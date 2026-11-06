@@ -4,6 +4,7 @@ import { openCamera, makeRecorder, type CameraHandle } from '../lib/camera';
 import { simulateShot, speedDisplay, distDisplay, mToFt } from '../lib/physics';
 import { spinFor, type Settings } from '../lib/settings';
 import { saveShot, type ShotRecord } from '../lib/storage';
+import { beep, warmupAudio } from '../lib/beep';
 
 interface Props {
   settings: Settings;
@@ -46,6 +47,14 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+
+  // beeps fire from camera callbacks, which iOS forbids unless the page has
+  // already had a user gesture — warm the AudioContext on first tap
+  useEffect(() => {
+    const h = () => warmupAudio();
+    window.addEventListener('pointerdown', h, { once: true });
+    return () => window.removeEventListener('pointerdown', h);
+  }, []);
 
   // lives in a ref so the camera effect can call it and it always sees
   // fresh settings (club, spin defaults…)
@@ -187,14 +196,20 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
 
   function handleDetectorEvent(e: Parameters<ShotDetector['onEvent']>[0]) {
     if (e.type === 'ballDetected') {
+      beep(1); // locked & ready for the swing
       startRecorder();
     } else if (e.type === 'armedTimeout') {
       stopRecorder(false, () => {});
       showToast('Armed timed out — waiting for a new ball.', 2500);
+    } else if (e.type === 'trackAborted') {
+      // hand/body triggered the capture but nothing ball-like was moving:
+      // quietly return to armed and keep the recorder rolling so clips still
+      // cover the next real swing (same as the normal armed behavior)
     } else if (e.type === 'shotDisqualified') {
       stopRecorder(false, () => {});
       showToast('Ball not tracked — place the ball and swing again.', 3000);
     } else if (e.type === 'shot') {
+      beep(2); // shot captured — confirmation
       const cal = settingsRef.current.cal!;
       stopRecorder(true, (clip) => finalizeShot(e.metrics.ballSpeedMps, e.metrics.launchDeg, e.metrics.trackCount, clip, cal));
     }

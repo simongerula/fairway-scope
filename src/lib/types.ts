@@ -32,6 +32,7 @@ export interface ShotMetrics {
 export type DetectorEvent =
   | { type: 'ballDetected' }          // ball placed & stable -> armed
   | { type: 'armedTimeout' }          // armed but no shot for a while -> standby again
+  | { type: 'trackAborted' }          // non-ball motion (hand/body) triggered capture -> back to armed
   | { type: 'shotDisqualified'; reason: 'no-ball-track' } // impact but ball not tracked
   | { type: 'shot'; metrics: ShotMetrics; points: TrackedPoint[] };
 

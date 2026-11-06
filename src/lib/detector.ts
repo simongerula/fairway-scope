@@ -50,6 +50,12 @@ export interface DetectorOptions {
 
 const DEFAULT_OPTS: DetectorOptions = { minSpeedMps: 4, maxSpeedMps: 110 };
 
+/** after arming, hold triggers this long so the hand leaving the ball doesn't fire */
+const QUIET_HOLD_MS = 250;
+
+/** after a false-trigger abort, hold triggers this long so the intruder doesn't re-fire */
+const ABORT_QUIET_MS = 700;
+
 export class ShotDetector {
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
@@ -60,6 +66,10 @@ export class ShotDetector {
   private threshold = 26;
 
   private bg: Float32Array = new Float32Array(0);
+  /** 1 = cell lies over the resting ball; never adapt those cells while waiting/armed. */
+  private ballProtect: Uint8Array = new Uint8Array(0);
+  /** number of motion-active cells in the last frame (scene-change guard). */
+  private lastActiveCount = 0;
   private lastVideoT = -1;
 
   state: DetectorState = 'waiting';
@@ -89,6 +99,8 @@ export class ShotDetector {
   private recStartWall = 0;
   private staleFrames = 0;
   private cooldownUntilWall = 0;
+  /** wall time until which triggers are held after a false-trigger abort */
+  private quietUntilWall = 0;
 
   attach(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -113,8 +125,8 @@ export class ShotDetector {
 
     // analysis rect = ball area padded generously, plus everything downrange
     const padX = this.ballR * 6;
-    const y0 = Math.max(0, Math.floor((this.ballY - this.ballR * 12) / CELL)) * CELL;
-    const y1 = Math.min(vh, Math.ceil(this.ballY + this.ballR * 12));
+    const y0 = Math.max(0, Math.floor((this.ballY - this.ballR * 16) / CELL)) * CELL;
+    const y1 = Math.min(vh, Math.ceil(this.ballY + this.ballR * 16));
     const x0 = this.hitDir === 1 ? Math.max(0, Math.floor((this.ballX - padX) / CELL)) * CELL : 0;
     const x1 = this.hitDir === 1 ? PROC_W : Math.min(PROC_W, Math.ceil(this.ballX + padX));
     this.gx0 = x0;
@@ -125,6 +137,22 @@ export class ShotDetector {
     this.cols = Math.ceil(this.gw / CELL);
     this.rows = Math.ceil(this.gh / CELL);
     this.bg = new Float32Array(this.cols * this.rows).fill(-1);
+
+    // Protect the resting ball's footprint from background adaptation: without
+    // this, the running-average background slowly absorbs the white ball and
+    // the detector "forgets" it after a couple of seconds.
+    this.ballProtect = new Uint8Array(this.cols * this.rows);
+    const protR = this.ballR * 2.5;
+    const pxL = this.ballX - this.gx0;
+    const pyL = this.ballY - this.gy0;
+    for (let r = 0; r < this.rows; r++) {
+      const cellY = r * CELL + CELL / 2;
+      if (Math.abs(cellY - pyL) > protR) continue;
+      for (let c = 0; c < this.cols; c++) {
+        const cellX = c * CELL + CELL / 2;
+        if (Math.abs(cellX - pxL) <= protR) this.ballProtect[r * this.cols + c] = 1;
+      }
+    }
   }
 
   procSize(): { w: number; h: number } {
@@ -146,6 +174,7 @@ export class ShotDetector {
     this.candFrames = 0;
     this.goneFrames = 0;
     this.staleFrames = 0;
+    this.quietUntilWall = 0;
     if (this.bg.length) this.bg.fill(-1);
   }
 
@@ -207,7 +236,8 @@ export class ShotDetector {
   }
 
   private stepWaiting(grid: Float32Array) {
-    const comps = this.findComponents(grid);
+    // freeze: never let the running-average background eat the placed ball
+    const comps = this.findComponents(grid, true);
     const expected = this.expectedBallArea();
     let cand: Component | null = null;
     for (const c of comps) {
@@ -243,8 +273,9 @@ export class ShotDetector {
       }
     } else {
       this.resetCandidate();
-      // adapt slowly while waiting, but only when the zone is quiet
-      this.adaptBackground(grid, 0.06);
+      // adapt slowly while waiting, but only when the zone is quiet — and
+      // never blend the resting ball into the background
+      this.adaptBackground(grid, 0.06, true);
     }
   }
 
@@ -254,7 +285,25 @@ export class ShotDetector {
       return { type: 'armedTimeout' };
     }
 
-    const comps = this.findComponents(grid, /* freeze */ true);
+    // right after a false trigger (hand/body crossing the zone) hold still for
+    // a moment so the intruder doesn't immediately re-trigger the detector
+    if (wallT - this.armedAtWall < QUIET_HOLD_MS || wallT < this.quietUntilWall) {
+      this.adaptBackground(grid, 0.05, true);
+      this.goneFrames = 0;
+      return null;
+    }
+
+    const comps = this.findComponents(grid, true);
+
+    // someone/something moved most of the scene (a body walks through, big
+    // light change) — re-adapt around the protected ball and skip triggers
+    const n = grid.length;
+    if (this.lastActiveCount > n * 0.35) {
+      this.adaptBackground(grid, 0.3, true);
+      this.goneFrames = 0;
+      return null;
+    }
+
     const expected = this.expectedBallArea();
 
     // fast motion near the ball => shot in progress
@@ -289,7 +338,9 @@ export class ShotDetector {
     } else {
       this.goneFrames = 0;
     }
-    this.adaptBackground(grid, 0.015);
+    // adapt everything except the ball's own footprint, so a swinging stance
+    // or lighting drift never erases the lock
+    this.adaptBackground(grid, 0.05, true);
     return null;
   }
 
@@ -310,7 +361,9 @@ export class ShotDetector {
     let best: Component | null = null;
     const last = this.points[this.points.length - 1];
     for (const c of comps) {
-      if (c.cells < expected * 0.22 || c.cells > expected * 14) continue;
+      // upper bound is generous: motion blur spreads a fast ball into a long
+      // streak (a 30+ m/s ball paints many times the resting-ball area)
+      if (c.cells < expected * 0.18 || c.cells > expected * 40) continue;
       const dxRange = (c.cx - this.ballX) * this.hitDir;
       if (dxRange < this.ballR * 1.1) continue;
       if (!best) { best = c; continue; }
@@ -333,7 +386,9 @@ export class ShotDetector {
           const dpx = Math.hypot(dx, dy);
           const speedMps = dpx / dtF / pxPerMeter;
           const dirOk = dx * this.hitDir > 0;
-          if (dirOk && speedMps > this.opts.minSpeedMps && speedMps < this.opts.maxSpeedMps && dpx < this.ballR * 16) {
+          // distance cap is the whole view: a real ball at 30-70 m/s jumps
+          // 100+ px per frame, anything tighter would reject every shot
+          if (dirOk && speedMps > this.opts.minSpeedMps && speedMps < this.opts.maxSpeedMps && dpx < PROC_W) {
             this.points.push({ t: videoT, x: best.cx, y: best.cy });
             advanced = true;
           }
@@ -345,9 +400,16 @@ export class ShotDetector {
 
     const elapsed = wallT - this.recStartWall;
     if (this.staleFrames >= 4 || this.points.length >= 24 || (elapsed > 1500 && this.points.length >= 2)) {
-      return this.finishShot();
+      if (this.points.length >= 2) return this.finishShot();
+      if (this.points.length === 0 && elapsed < 900) {
+        // no ball-like motion at all: this was almost certainly a hand, body
+        // or club passing through the zone. Abandon silently and stay armed.
+        return this.abortRecordingToArmed(wallT);
+      }
+      return this.finishShot(); // 1 point => disqualified with a visible message
     }
     if (elapsed > 1500 && this.points.length < 2) {
+      if (this.points.length === 0) return this.abortRecordingToArmed(wallT);
       this.state = 'cooldown';
       this.cooldownUntilWall = wallT + 1000;
       this.points = [];
@@ -355,6 +417,16 @@ export class ShotDetector {
     }
     this.adaptBackground(grid, 0.015);
     return null;
+  }
+
+  /** False trigger (motion without ball-like track): quietly return to armed. */
+  private abortRecordingToArmed(wallT: number): DetectorEvent {
+    this.state = 'armed';
+    this.points = [];
+    this.staleFrames = 0;
+    this.goneFrames = 0;
+    this.quietUntilWall = wallT + ABORT_QUIET_MS;
+    return { type: 'trackAborted' };
   }
 
   private finishShot(): DetectorEvent | null {
@@ -414,10 +486,14 @@ export class ShotDetector {
     if (this.bg.length !== n) return comps;
     const active = new Uint8Array(n);
     const th = this.threshold;
+    let activeCount = 0;
     for (let i = 0; i < n; i++) {
       if (this.bg[i] < 0) continue;
-      active[i] = Math.abs(grid[i] - this.bg[i]) > th ? 1 : 0;
+      const a = Math.abs(grid[i] - this.bg[i]) > th ? 1 : 0;
+      active[i] = a;
+      activeCount += a;
     }
+    this.lastActiveCount = activeCount;
     const seen = new Uint8Array(n);
     const stack: number[] = [];
     for (let i = 0; i < n; i++) {
@@ -450,13 +526,13 @@ export class ShotDetector {
       if (comps.length > 40) break;
     }
     comps.sort((a, b) => b.cells - a.cells);
-    if (!freeze) this.adaptBackground(grid, 0.06);
     return comps;
   }
 
-  private adaptBackground(grid: Float32Array, rate: number) {
+  private adaptBackground(grid: Float32Array, rate: number, protect = false) {
     const n = grid.length;
     for (let i = 0; i < n; i++) {
+      if (protect && this.ballProtect[i]) continue;
       if (this.bg[i] < 0) this.bg[i] = grid[i];
       else this.bg[i] += (grid[i] - this.bg[i]) * rate;
     }
