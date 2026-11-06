@@ -361,28 +361,32 @@ export class ShotDetector {
     const comps = this.findComponents(grid, true);
 
     // someone/something moved most of the scene (a body walks through, big
-    // light change) — re-adapt around the protected ball and skip triggers
-    const n = grid.length;
-    if (this.lastActiveCount > n * 0.35) {
+    // light change): adapt around the protected ball and skip the fast-motion
+    // pre-trigger. The spot-change check below stays live — suppressing it
+    // here would swallow real swings (club sweep + blur light up the ROI at
+    // impact), and its false positives resolve through the outcome logic.
+    let bigSceneChange = false;
+    if (this.lastActiveCount > grid.length * 0.35) {
+      bigSceneChange = true;
       this.adaptBackground(grid, 0.3, true);
-      this.goneFrames = 0;
-      return null;
     }
 
     const expected = this.expectedBallArea();
 
     // fast motion near the ball => shot in progress
-    for (const c of comps) {
-      const dxRange = (c.cx - this.ballX) * this.hitDir;
-      const dyRange = Math.abs(c.cy - this.ballY);
-      if (
-        dxRange > this.ballR * 2 &&
-        dxRange < this.ballR * 14 &&
-        dyRange < this.ballR * 5 &&
-        c.cells >= expected * 0.4
-      ) {
-        this.beginRecording(wallT, 'motion');
-        return null;
+    if (!bigSceneChange) {
+      for (const c of comps) {
+        const dxRange = (c.cx - this.ballX) * this.hitDir;
+        const dyRange = Math.abs(c.cy - this.ballY);
+        if (
+          dxRange > this.ballR * 2 &&
+          dxRange < this.ballR * 14 &&
+          dyRange < this.ballR * 5 &&
+          c.cells >= expected * 0.4
+        ) {
+          this.beginRecording(wallT, 'motion');
+          return null;
+        }
       }
     }
 
@@ -404,8 +408,8 @@ export class ShotDetector {
       this.goneFrames = 0;
     }
     // adapt everything except the ball's own footprint, so a swinging stance
-    // or lighting drift never erases the lock
-    this.adaptBackground(grid, 0.05, true);
+    // or lighting drift never erases the lock (bigSceneChange already adapted)
+    if (!bigSceneChange) this.adaptBackground(grid, 0.05, true);
     return null;
   }
 

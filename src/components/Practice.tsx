@@ -220,6 +220,10 @@ export default function Practice({ settings, patch, onOpenSetup }: Props) {
     }
   }
 
+  // route every detector event (onEvent + update() returns) to the handler;
+  // the camera-loop callbacks call through this ref, so keep it current
+  eventHandlerRef.current = handleDetectorEvent;
+
   function finalizeShot(
     ballSpeedMps: number,
     launchDeg: number,
